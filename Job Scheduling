@@ -1,0 +1,307 @@
+#include <iostream>
+#include <thread>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <mutex>
+
+using namespace std;
+
+static const int numJobsMax = 2;  // maximum jobs allowed to run simulataneously
+int numJobsRunning = 0;
+bool programEndFlag = false;
+int lastJobID = 1;
+enum status { jobReadyToRun, jobRunning, jobToBeStopped };
+enum resources { none, A, B, C, AB, BA, BC, CB, AC, CA };
+
+struct job {
+	string jobName;  // name of the job
+	int jobID;  // unique # for job ID
+	status jobStatus = jobReadyToRun;  // initialize status
+	resources jobResources = none;  // no resources by default
+	int jobProcessTime = 10;  // default process time = 10 sec
+};
+
+vector<job*> jobQueue;  // system queue for user created jobs
+mutex jobQueueLock;  // lock for job queue
+mutex resourceA;  // lock for resouce A
+mutex resourceB;  // lock for resouce B
+mutex resourceC;  // lock for resouce C
+
+/* function prototyping */
+void jobDispatch();  // dispath job from the job queue in the background (thread)
+void runJob(job*);  // run job as a thread
+void batchJobs();  // run a predefined batch job queue
+
+int main() {
+	int choice;
+	job* jobPtr;
+
+	/* run Job Dispatcher in the background as a thread */
+	std::thread t = std::thread(jobDispatch);
+	t.detach();
+
+	/* Allow user to schedule or delete jobs */
+	programEndFlag = false;
+	do {
+		cout << "\nJob Scheduling Options:\n";
+		cout << "1: Start a new job\n";
+		cout << "2: Stop a running job\n";
+		cout << "3: Display job queue\n";
+		cout << "4: Run the pre-defined batch job\n";
+		cout << "99: Exit\n";
+		cout << "Please enter your choice (#): ";
+		cin >> choice;
+
+		switch (choice) {
+		case 1:
+			jobPtr = new job;
+			cout << "Enter Job Name: ";
+			cin >> jobPtr->jobName;
+			jobPtr->jobID = lastJobID++;
+			jobPtr->jobStatus = jobReadyToRun;  // set status to ReadyToRun for jobDispatch()
+			jobQueueLock.lock();
+			jobQueue.push_back(jobPtr);  // push new job to job queue
+			jobQueueLock.unlock();
+			break;
+		case 2:
+			unsigned int jobIDstop, i;
+			cout << "Enter Job ID: ";
+			cin >> jobIDstop;
+			jobQueueLock.lock();
+			for (i = 0; i < jobQueue.size(); i++) {
+				jobPtr = jobQueue[i];
+				if (jobIDstop == jobPtr->jobID) {
+					if (jobPtr->jobStatus != jobRunning) {
+						cout << "Job ID = " << jobIDstop << " is not running yet.\n";
+					}
+					else {
+						jobPtr->jobStatus = jobToBeStopped;
+						cout << "Job ID = " << jobIDstop << " has scheduled to stop.\n";
+					}
+					break;
+				}
+			}
+			if (i == jobQueue.size()) // end of queue reached
+				cout << "Job ID = " << jobIDstop << " cannot be found.\n";
+			jobQueueLock.unlock();
+			break;
+		case 3:
+			jobQueueLock.lock();
+			cout << "\nNumber of Jobs: " << jobQueue.size() << endl;
+			for (unsigned int i = 0; i < jobQueue.size(); i++) {
+				jobPtr = jobQueue[i];
+				cout << "Name=" << jobPtr->jobName << " ";
+				cout << "ID=" << jobPtr->jobID << " ";
+				if (jobPtr->jobStatus == jobRunning) cout << "Status=Running." << endl;
+				if (jobPtr->jobStatus == jobReadyToRun) cout << "Status=ReadyToRun." << endl;
+				if (jobPtr->jobStatus == jobToBeStopped) cout << "Status=ToBeStopped." << endl;
+			}
+			jobQueueLock.unlock();
+			break;
+		case 4:
+			cout << "\nStarting the batch job ...";
+			batchJobs();
+			cout << "\nBatch job submitted." << endl;
+			break;
+		}
+
+	} while (choice != 99);
+
+	std::cout << "\nMain Program ended\n";
+	programEndFlag = true;
+	system("pause");
+
+	// remove job files before exit program
+	system("del Job*");
+	system("del stop_Job*");
+	return 0;
+}
+
+// dispath job from the job queue in the background (thread)
+void jobDispatch() {
+	int activeJobs;
+
+	// this thread loops forever until error occurs or program ends
+	while (true) {
+		if (programEndFlag) break;  // End this thread when user exit program
+
+		// Validate # of running jobs are less than maximum allowed
+		activeJobs = 0;
+		jobQueueLock.lock();
+		for (unsigned int i = 0; i < jobQueue.size(); i++)
+			if (jobQueue[i]->jobStatus == jobRunning)
+				activeJobs++;
+		jobQueueLock.unlock();
+		if (activeJobs > numJobsMax) {
+			cout << "Error: more jobs running than maximum allowed" << endl;
+			return;
+		}
+
+		// Run jobs with status ReadyToRun
+		jobQueueLock.lock();
+		for (unsigned int i = 0; i < jobQueue.size(); i++) {
+			if (activeJobs < numJobsMax && jobQueue[i]->jobStatus == jobReadyToRun) {
+				activeJobs++;
+				std::thread t = std::thread(runJob, jobQueue[i]);
+				t.detach();
+				jobQueue[i]->jobStatus = jobRunning;
+			}
+		}
+		jobQueueLock.unlock();
+
+		// Terminate jobs with status jobToBeStopped
+		jobQueueLock.lock();
+		for (unsigned int i = 0; i < jobQueue.size(); i++) {
+			if (jobQueue[i]->jobStatus == jobToBeStopped) {
+				activeJobs--;
+				string jobFile, cmdLine;
+				jobFile = "Job" + to_string(jobQueue[i]->jobID) + ".txt";
+				cmdLine = "ren " + jobFile + " " + "stop_" + jobFile;
+				system((cmdLine).c_str());
+				jobQueue.erase(jobQueue.begin() + i);
+			}
+		}
+		jobQueueLock.unlock();
+		// this_thread::sleep_for(std::chrono::seconds(5));
+	}
+}
+
+// run job as a thread
+void runJob(job* jobPtr) {
+	string jobFile, cmdLine;
+	jobFile = "Job" + to_string(jobPtr->jobID) + ".txt";
+	ofstream outFile(jobFile);
+	outFile << "Job" << jobPtr->jobID << " - " << jobPtr->jobName << " is running ..." << endl;
+
+	// Check if resources A, B and/or C are requested (upto 2 resources can be used)
+	switch (jobPtr->jobResources) {
+	case A:
+		outFile << "Requesting resource A ..." << endl;
+		resourceA.lock();
+		outFile << "Got resource A." << endl;
+		resourceA.unlock();
+		break;
+	case B:
+		outFile << "Requesting resource B ..." << endl;
+		resourceB.lock();
+		outFile << "Got resource B." << endl;
+		resourceB.unlock();
+		break;
+	case C:
+		outFile << "Requesting resource C ..." << endl;
+		resourceC.lock();
+		outFile << "Got resource C." << endl;
+		resourceC.unlock();
+		break;
+	case AB:
+		outFile << "Requesting resource A ..." << endl;
+		resourceA.lock();
+		outFile << "Got resource A." << endl;
+		this_thread::sleep_for(std::chrono::seconds(5));  // doing something
+		outFile << "Requesting resource B ..." << endl;
+		resourceB.lock();
+		outFile << "Got resource B." << endl;
+		resourceA.unlock();
+		resourceB.unlock();
+		break;
+	case BA:
+		outFile << "Requesting resource B ..." << endl;
+		resourceB.lock();
+		outFile << "Got resource B." << endl;
+		this_thread::sleep_for(std::chrono::seconds(5));  // doing something
+		outFile << "Requesting resource A ..." << endl;
+		resourceA.lock();
+		outFile << "Got resource A." << endl;
+		resourceB.unlock();
+		resourceA.unlock();
+		break;
+	case BC:
+		outFile << "Requesting resource B ..." << endl;
+		resourceB.lock();
+		outFile << "Got resource B." << endl;
+		this_thread::sleep_for(std::chrono::seconds(5));  // doing something
+		outFile << "Requesting resource C ..." << endl;
+		resourceC.lock();
+		outFile << "Got resource C." << endl;
+		resourceB.unlock();
+		resourceC.unlock();
+		break;
+	case CB:
+		outFile << "Requesting resource C ..." << endl;
+		resourceC.lock();
+		outFile << "Got resource C." << endl;
+		this_thread::sleep_for(std::chrono::seconds(5));  // doing something
+		outFile << "Requesting resource B ..." << endl;
+		resourceB.lock();
+		outFile << "Got resource B." << endl;
+		resourceC.unlock();
+		resourceB.unlock();
+		break;
+	case AC:
+		outFile << "Requesting resource A ..." << endl;
+		resourceA.lock();
+		outFile << "Got resource A." << endl;
+		this_thread::sleep_for(std::chrono::seconds(5));  // doing something
+		outFile << "Requesting resource C ..." << endl;
+		resourceC.lock();
+		outFile << "Got resource C." << endl;
+		resourceA.unlock();
+		resourceC.unlock();
+		break;
+		break;
+	case CA:
+		outFile << "Requesting resource C ..." << endl;
+		resourceC.lock();
+		outFile << "Got resource C." << endl;
+		this_thread::sleep_for(std::chrono::seconds(5));  // doing something
+		outFile << "Requesting resource A ..." << endl;
+		resourceA.lock();
+		outFile << "Got resource A." << endl;
+		resourceC.unlock();
+		resourceA.unlock();
+		break;
+	case none:
+		break;
+	}
+
+	this_thread::sleep_for(std::chrono::seconds(jobPtr->jobProcessTime));  // doing something
+	outFile << "Job completed." << endl;
+	outFile.close();
+	jobPtr->jobStatus = jobToBeStopped;  // set job status so it will be removed from queue
+}
+
+// run a predefined batch job queue
+void batchJobs() {
+	job* jobPtr;
+
+	jobPtr = new job;
+	jobPtr->jobName = "John-1";
+	jobPtr->jobID = lastJobID++;
+	jobPtr->jobStatus = jobReadyToRun;
+	jobPtr->jobResources = AB;
+	jobPtr->jobProcessTime = 10;
+	jobQueueLock.lock();
+	jobQueue.push_back(jobPtr);
+	jobQueueLock.unlock();
+
+	jobPtr = new job;
+	jobPtr->jobName = "Dave-2";
+	jobPtr->jobID = lastJobID++;
+	jobPtr->jobStatus = jobReadyToRun;
+	jobPtr->jobResources = BC;
+	jobPtr->jobProcessTime = 10;
+	jobQueueLock.lock();
+	jobQueue.push_back(jobPtr);
+	jobQueueLock.unlock();
+
+	jobPtr = new job;
+	jobPtr->jobName = "Kate-3";
+	jobPtr->jobID = lastJobID++;
+	jobPtr->jobStatus = jobReadyToRun;
+	jobPtr->jobResources = CA;
+	jobPtr->jobProcessTime = 10;
+	jobQueueLock.lock();
+	jobQueue.push_back(jobPtr);
+	jobQueueLock.unlock();
+}
